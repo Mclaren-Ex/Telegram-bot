@@ -1022,3 +1022,22 @@ bot.on('polling_error', (error) => {
 });
 
 module.exports = { bot, db };
+
+// Export for server.js
+module.exports = {
+  bot: bot,
+  db: db,
+  startBot: function() {
+    console.log('🤖 Anime Card Bot Started!');
+    console.log('🎴 Card drops: Every 25 minutes');
+    console.log('🛡️ Admin system: Active');
+    console.log('💬 DM commands: Full game features');
+    return true;
+  }
+};
+
+// If this file is run directly, start the bot
+if (require.main === module) {
+  console.log('🚀 Starting bot in standalone mode...');
+  module.exports.startBot();
+}
