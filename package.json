@@ -8,7 +8,14 @@
     "dev": "nodemon server.js",
     "test": "echo \"No tests specified\" && exit 0"
   },
-  "keywords": ["telegram", "bot", "anime", "zenon"],
+  "keywords": [
+    "telegram",
+    "bot",
+    "anime",
+    "cards",
+    "game",
+    "zenon"
+  ],
   "author": "Zenon",
   "license": "MIT",
   "dependencies": {
