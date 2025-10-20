@@ -1,681 +1,395 @@
-const TelegramBot = require('node-telegram-bot-api');
-const sqlite3 = require('sqlite3').verbose();
-const cron = require('node-cron');
-const moment = require('moment');
-const axios = require('axios');
+// 🎯 CONTINUATION FROM PART 1...
 
-// Bot setup - YOUR ACTUAL TOKEN
-const token = '8461726439:AAFRf0lB1QK9m0POjlwaJA0eV6nkW-Zjqjo';
-const bot = new TelegramBot(token, { polling: true });
+// ⚔️ ENHANCED BATTLE SYSTEM
+bot.onText(/\/battle (@\w+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const player1Id = msg.from.id;
+  const player1Name = msg.from.username || msg.from.first_name;
+  const player2Username = match[1].replace('@', '');
+  
+  if (chatId.toString() !== GROUP_ID) {
+    bot.sendMessage(chatId, '❌ Battles only work in the main group!');
+    return;
+  }
 
-// Database setup
-const db = new sqlite3.Database('./anime_cards.db');
+  // Check energy
+  db.get(`SELECT energy FROM users WHERE user_id = ?`, [player1Id], (err, player) => {
+    if (!player || player.energy < 10) {
+      bot.sendMessage(chatId, '❌ Not enough energy! Need 10 energy to battle.');
+      return;
+    }
 
-// Store active trades, auctions, and banned users
-const activeTrades = new Map();
-const activeAuctions = new Map();
-const userSessions = new Map();
-const bannedUsers = new Map(); // user_id -> ban expiry timestamp
-const activeRedeemCodes = new Map(); // code -> {card, expiry}
+    // Find player 2
+    db.get(`SELECT user_id, username FROM users WHERE username = ?`, [player2Username], (err, player2) => {
+      if (!player2) {
+        bot.sendMessage(chatId, `❌ User @${player2Username} not found!`);
+        return;
+      }
 
-// Admin users - YOUR ACTUAL USER ID
-const ADMINS = [6094186912];
-const GROUP_ID = '-1003149343469';
+      // Start battle
+      const battleId = `${player1Id}_${player2.user_id}_${Date.now()}`;
+      userSessions.set(battleId, {
+        player1: { id: player1Id, name: player1Name },
+        player2: { id: player2.user_id, name: player2Username },
+        stage: 'team_selection'
+      });
 
-// Initialize database
-db.serialize(() => {
-  // Users table with admin field
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    username TEXT,
-    registered_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-    coins INTEGER DEFAULT 500,
-    dust INTEGER DEFAULT 0,
-    last_daily DATETIME,
-    last_claim DATETIME,
-    last_weekly DATETIME,
-    inventory_slots INTEGER DEFAULT 100,
-    battle_rank INTEGER DEFAULT 1,
-    total_cards INTEGER DEFAULT 0,
-    battles_won INTEGER DEFAULT 0,
-    battles_lost INTEGER DEFAULT 0,
-    total_trades INTEGER DEFAULT 0,
-    achievement_points INTEGER DEFAULT 0,
-    title TEXT DEFAULT 'Beginner',
-    level INTEGER DEFAULT 1,
-    exp INTEGER DEFAULT 0,
-    energy INTEGER DEFAULT 100,
-    last_energy_update DATETIME DEFAULT CURRENT_TIMESTAMP,
-    is_admin INTEGER DEFAULT 0,
-    warnings INTEGER DEFAULT 0
-  )`);
+      // Deduct energy
+      db.run(`UPDATE users SET energy = energy - 10 WHERE user_id = ?`, [player1Id]);
 
-  // Cards table
-  db.run(`CREATE TABLE IF NOT EXISTS cards (
-    card_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    card_name TEXT NOT NULL,
-    card_anime TEXT NOT NULL,
-    card_rarity TEXT NOT NULL,
-    card_image TEXT,
-    card_power INTEGER,
-    card_element TEXT,
-    card_series TEXT,
-    created_date DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
+      bot.sendMessage(chatId,
+        `⚔️ **BATTLE CHALLENGE!** ⚔️\n\n` +
+        `👤 Challenger: @${player1Name}\n` +
+        `🎯 Opponent: @${player2Username}\n\n` +
+        `@${player2Username} type /acceptbattle to fight!\n` +
+        `⏰ Expires in 2 minutes`,
+        { parse_mode: 'Markdown' }
+      );
 
-  // User inventory
-  db.run(`CREATE TABLE IF NOT EXISTS user_cards (
-    user_card_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    card_id INTEGER,
-    obtained_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-    is_locked INTEGER DEFAULT 0,
-    is_favorite INTEGER DEFAULT 0,
-    upgrade_level INTEGER DEFAULT 0,
-    FOREIGN KEY(user_id) REFERENCES users(user_id),
-    FOREIGN KEY(card_id) REFERENCES cards(card_id)
-  )`);
-
-  // Achievements table
-  db.run(`CREATE TABLE IF NOT EXISTS achievements (
-    achievement_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    achievement_name TEXT,
-    achievement_desc TEXT,
-    achieved_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-    reward_coins INTEGER DEFAULT 0,
-    FOREIGN KEY(user_id) REFERENCES users(user_id)
-  )`);
-
-  // Market listings
-  db.run(`CREATE TABLE IF NOT EXISTS market (
-    listing_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    card_id INTEGER,
-    price INTEGER,
-    listed_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-    is_sold INTEGER DEFAULT 0,
-    FOREIGN KEY(user_id) REFERENCES users(user_id),
-    FOREIGN KEY(card_id) REFERENCES cards(card_id)
-  )`);
-
-  // Initialize sample cards
-  initializeSampleCards();
+      // Expire battle request
+      setTimeout(() => {
+        if (userSessions.has(battleId)) {
+          userSessions.delete(battleId);
+          bot.sendMessage(chatId, `⏰ Battle challenge from @${player1Name} expired.`);
+        }
+      }, 2 * 60 * 1000);
+    });
+  });
 });
 
-// 🛡️ BAN CHECK MIDDLEWARE
-function checkBan(userId) {
-  const banExpiry = bannedUsers.get(userId);
-  if (banExpiry && Date.now() < banExpiry) {
-    const minutesLeft = Math.ceil((banExpiry - Date.now()) / (1000 * 60));
-    return `🚫 You are banned for ${minutesLeft} more minutes for violating rules.`;
-  }
-  if (banExpiry && Date.now() >= banExpiry) {
-    bannedUsers.delete(userId); // Remove expired ban
-  }
-  return null;
-}
+bot.onText(/\/acceptbattle/, (msg) => {
+  const chatId = msg.chat.id;
+  const player2Id = msg.from.id;
+  const player2Name = msg.from.username || msg.from.first_name;
 
-// 🔧 ADMIN CHECK FUNCTION
-function isAdmin(userId) {
-  return ADMINS.includes(userId) || isUserAdminInDB(userId);
-}
+  // Find active battle
+  let battleId = null;
+  for (const [id, session] of userSessions.entries()) {
+    if (session.player2.id === player2Id && session.stage === 'team_selection') {
+      battleId = id;
+      break;
+    }
+  }
 
-function isUserAdminInDB(userId) {
-  return new Promise((resolve) => {
-    db.get(`SELECT is_admin FROM users WHERE user_id = ?`, [userId], (err, user) => {
-      resolve(user && user.is_admin === 1);
+  if (!battleId) {
+    bot.sendMessage(chatId, '❌ No pending battle challenges found!');
+    return;
+  }
+
+  const battle = userSessions.get(battleId);
+  battle.stage = 'battle_active';
+
+  // Start the battle
+  simulateBattle(battleId, chatId);
+});
+
+function simulateBattle(battleId, chatId) {
+  const battle = userSessions.get(battleId);
+  const player1 = battle.player1;
+  const player2 = battle.player2;
+
+  // Get player cards and calculate power
+  db.all(`SELECT c.card_power, c.card_rarity FROM user_cards uc 
+          JOIN cards c ON uc.card_id = c.card_id 
+          WHERE uc.user_id = ? ORDER BY c.card_power DESC LIMIT 5`, 
+          [player1.id], (err, player1Cards) => {
+    
+    db.all(`SELECT c.card_power, c.card_rarity FROM user_cards uc 
+            JOIN cards c ON uc.card_id = c.card_id 
+            WHERE uc.user_id = ? ORDER BY c.card_power DESC LIMIT 5`, 
+            [player2.id], (err, player2Cards) => {
+
+      const player1Power = player1Cards.reduce((sum, card) => sum + card.card_power, 0);
+      const player2Power = player2Cards.reduce((sum, card) => sum + card.card_power, 0);
+
+      // Add random factor
+      const randomFactor = 0.8 + (Math.random() * 0.4);
+      const player1Score = Math.floor(player1Power * randomFactor);
+      const player2Score = Math.floor(player2Power * (1.2 - randomFactor));
+
+      let winner, loser, winnerScore, loserScore;
+      
+      if (player1Score > player2Score) {
+        winner = player1;
+        loser = player2;
+        winnerScore = player1Score;
+        loserScore = player2Score;
+      } else {
+        winner = player2;
+        loser = player1;
+        winnerScore = player2Score;
+        loserScore = player1Score;
+      }
+
+      // Battle results
+      const reward = 100 + Math.floor(Math.random() * 100);
+      
+      // Update database
+      db.run(`UPDATE users SET battles_won = battles_won + 1, coins = coins + ? WHERE user_id = ?`, 
+             [reward, winner.id]);
+      db.run(`UPDATE users SET battles_lost = battles_lost + 1 WHERE user_id = ?`, [loser.id]);
+
+      const battleText = `⚔️ **BATTLE RESULTS** ⚔️\n\n` +
+        `🎯 ${player1.name} vs ${player2.name}\n\n` +
+        `💥 ${player1.name}: ${player1Score} power\n` +
+        `💥 ${player2.name}: ${player2Score} power\n\n` +
+        `🏆 **VICTORY FOR @${winner.name}!**\n` +
+        `🪙 Reward: ${reward} coins\n\n` +
+        `🎴 Use /battle @user to challenge someone!`;
+
+      bot.sendMessage(chatId, battleText, { parse_mode: 'Markdown' });
+      userSessions.delete(battleId);
     });
   });
 }
 
-// 🎴 CARD DROP SYSTEM (GROUP ONLY)
-cron.schedule('*/25 * * * *', () => {
-  postRandomCardDrop();
-});
-
-cron.schedule('0 */6 * * *', () => {
-  postSpecialEventCard();
-});
-
-cron.schedule('0 0 * * *', () => {
-  resetDailyEnergy();
-});
-
-// 🚀 COMMAND HANDLERS
-
-// START COMMAND - Works in both DM and Group
-bot.onText(/\/start/, async (msg) => {
+// 🤝 TRADING SYSTEM
+bot.onText(/\/trade (@\w+) (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const isPrivate = msg.chat.type === 'private';
-  const username = msg.from.username || msg.from.first_name;
+  const traderId = msg.from.id;
+  const traderName = msg.from.username || msg.from.first_name;
+  const targetUsername = match[1].replace('@', '');
+  const offer = match[2];
 
-  // Register user if not exists
-  db.run(`INSERT OR IGNORE INTO users (user_id, username, coins) VALUES (?, ?, 500)`, [userId, username]);
-
-  if (isPrivate) {
-    showMainMenu(chatId, userId);
-  } else {
-    bot.sendMessage(chatId, 
-      `👋 Hello ${username}! I'm *Anime Card Collector* by *Zenon*! 🎌\n\n` +
-      `💬 *Message me privately* to manage your collection and use all game commands!\n\n` +
-      `📨 Click here to start: @${bot.options.username}\n\n` +
-      `🎴 *Group Commands:*\n` +
-      `/redeem [code] - Claim card drops\n` +
-      `/help - Show available commands`,
-      { parse_mode: 'Markdown' }
-    );
-  }
-});
-
-// HELP COMMAND - Different responses for DM vs Group
-bot.onText(/\/help/, (msg) => {
-  const chatId = msg.chat.id;
-  const isPrivate = msg.chat.type === 'private';
-
-  if (isPrivate) {
-    // DM Help - Full command list
-    const helpText = `🎌 *Anime Card Bot by Zenon* - Complete Command List\n\n` +
-      `🎴 *CARD COMMANDS:*\n` +
-      `/collection - View your cards\n` +
-      `/openpack - Open card pack (100 coins)\n` +
-      `/upgrade [id] - Upgrade card\n` +
-      `/fuse [id1] [id2] - Fuse cards\n\n` +
-      `💰 *ECONOMY:*\n` +
-      `/balance - Check coins & energy\n` +
-      `/daily - Daily reward\n` +
-      `/weekly - Weekly bonus\n` +
-      `/shop - Buy items\n\n` +
-      `⚔️ *BATTLE:*\n` +
-      `/battle - Battle players\n` +
-      `/leaderboard - Rankings\n\n` +
-      `🤝 *TRADING:*\n` +
-      `/trade - Start trade\n` +
-      `/market - Marketplace\n\n` +
-      `🏆 *PROFILE:*\n` +
-      `/profile - Your stats\n` +
-      `/achievements - Your badges\n\n` +
-      `🎯 *Group-Only Commands:*\n` +
-      `/redeem [code] - Claim card drops\n\n` +
-      `⚙️ *Admin Commands:* (Admins only)\n` +
-      `/admindrop - Force card drop\n` +
-      `/ban [user] - Ban user\n` +
-      `/warn [user] - Warn user\n` +
-      `/broadcast - Send message to all users\n` +
-      `/adminstats - Bot statistics`;
-
-    bot.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
-  } else {
-    // Group Help - Limited commands
-    const helpText = `🎌 *Anime Card Bot by Zenon* - Group Commands\n\n` +
-      `🎴 *Available in Group:*\n` +
-      `/redeem [code] - Claim card drops\n` +
-      `/help - Show this help\n\n` +
-      `💬 *Full game available in private chat!*\n` +
-      `Message me @${bot.options.username} to:\n` +
-      `• Collect cards • Battle players • Trade cards\n` +
-      `• Earn coins • Complete quests • Unlock achievements`;
-
-    bot.sendMessage(chatId, helpText, { parse_mode: 'Markdown' });
-  }
-});
-
-// 🎴 REDEEM COMMAND - GROUP ONLY
-bot.onText(/\/redeem (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const isPrivate = msg.chat.type === 'private';
-  const code = match[1].toUpperCase();
-
-  // Only work in groups
-  if (isPrivate) {
-    bot.sendMessage(chatId, 
-      `❌ The /redeem command only works in groups when card drops appear!\n\n` +
-      `Join our group and wait for card drops every 25 minutes! 🎴`,
-      { parse_mode: 'Markdown' }
-    );
+  if (chatId.toString() !== GROUP_ID) {
+    bot.sendMessage(chatId, '❌ Trading only works in the main group!');
     return;
   }
 
-  // Check if user is banned
-  const banCheck = checkBan(userId);
-  if (banCheck) {
-    bot.sendMessage(chatId, banCheck);
-    return;
-  }
-
-  // Check if code exists and is valid
-  const redeemData = activeRedeemCodes.get(code);
-  if (!redeemData) {
-    bot.sendMessage(chatId, '❌ Invalid or expired redemption code!');
-    return;
-  }
-
-  if (Date.now() > redeemData.expiry) {
-    activeRedeemCodes.delete(code);
-    bot.sendMessage(chatId, '❌ This code has expired!');
-    return;
-  }
-
-  // Check if user already redeemed this code
-  if (redeemData.redeemedBy && redeemData.redeemedBy.includes(userId)) {
-    bot.sendMessage(chatId, '❌ You already redeemed this code!');
-    return;
-  }
-
-  // Mark code as redeemed by this user
-  if (!redeemData.redeemedBy) redeemData.redeemedBy = [];
-  redeemData.redeemedBy.push(userId);
-
-  // Add card to user's collection
-  const card = redeemData.card;
-  db.run(`INSERT INTO user_cards (user_id, card_id) VALUES (?, ?)`, [userId, card.card_id || 1], function(err) {
-    if (err) {
-      console.error('Error adding card:', err);
-      bot.sendMessage(chatId, '❌ Error redeeming card!');
-      return;
-    }
-
-    // Update user stats
-    db.run(`UPDATE users SET total_cards = total_cards + 1 WHERE user_id = ?`, [userId]);
-
-    const rarityEmojis = {
-      'Common': '🟢', 'Rare': '🔵', 'Epic': '🟣', 
-      'Legendary': '🟡', 'Mythical': '🔴'
-    };
-
-    const successMessage = `🎉 *CARD REDEEMED SUCCESSFULLY!*\n\n` +
-      `${rarityEmojis[card.rarity]} **${card.name}**\n` +
-      `📺 Anime: ${card.anime}\n` +
-      `⭐ Rarity: ${card.rarity}\n` +
-      `⚡ Power: ${card.power}\n` +
-      `🌀 Element: ${card.element}\n\n` +
-      `💫 Card added to your collection! Check your DM.`;
-
-    bot.sendMessage(chatId, successMessage, { parse_mode: 'Markdown' });
-
-    // Send confirmation to user's DM
-    try {
-      bot.sendMessage(userId,
-        `🎴 *New Card Obtained!*\n\n` +
-        `You redeemed: **${card.name}**\n` +
-        `From group drop - Code: ${code}\n\n` +
-        `Use /collection to view your cards!`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (error) {
-      console.log('Could not DM user');
-    }
+  // Create trade session
+  const tradeId = `${traderId}_${Date.now()}`;
+  userSessions.set(tradeId, {
+    trader: { id: traderId, name: traderName },
+    target: targetUsername,
+    offer: offer,
+    stage: 'pending'
   });
-});
 
-// 🛡️ ADMIN COMMANDS
-
-// ADMIN DROP - Force card drop in group
-bot.onText(/\/admindrop/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const isPrivate = msg.chat.type === 'private';
-
-  if (!(await isUserAdminInDB(userId)) && !ADMINS.includes(userId)) {
-    bot.sendMessage(chatId, '❌ Admin only command!');
-    return;
-  }
-
-  if (isPrivate) {
-    bot.sendMessage(chatId, '❌ This command only works in groups!');
-    return;
-  }
-
-  bot.sendMessage(chatId, '🎴 Admin forcing card drop...');
-  postRandomCardDrop();
-});
-
-// BAN USER - Admin only
-bot.onText(/\/ban (@\w+|\d+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  const target = match[1];
-
-  if (!(await isUserAdminInDB(adminId)) && !ADMINS.includes(adminId)) {
-    bot.sendMessage(chatId, '❌ Admin only command!');
-    return;
-  }
-
-  let targetUserId;
-  
-  // Handle both user ID and username
-  if (target.startsWith('@')) {
-    targetUserId = await getUserIdFromUsername(target.slice(1));
-  } else {
-    targetUserId = parseInt(target);
-  }
-
-  if (!targetUserId) {
-    bot.sendMessage(chatId, '❌ User not found! Use their user ID or @username');
-    return;
-  }
-
-  // Ban for 10 minutes
-  const banDuration = 10 * 60 * 1000; // 10 minutes in milliseconds
-  bannedUsers.set(targetUserId, Date.now() + banDuration);
-
-  bot.sendMessage(chatId, 
-    `🚫 User has been banned for 10 minutes!\n` +
-    `⏰ They will be automatically unbanned at ${new Date(Date.now() + banDuration).toLocaleTimeString()}`,
+  bot.sendMessage(chatId,
+    `🤝 **TRADE OFFER** 🤝\n\n` +
+    `👤 From: @${traderName}\n` +
+    `🎯 To: @${targetUsername}\n` +
+    `💎 Offer: ${offer}\n\n` +
+    `@${targetUsername} type /accepttrade to accept or /rejecttrade to decline\n` +
+    `⏰ Expires in 5 minutes`,
     { parse_mode: 'Markdown' }
   );
 
-  // Notify the banned user if possible
-  try {
-    bot.sendMessage(targetUserId, 
-      `🚫 *You have been banned for 10 minutes!*\n\n` +
-      `Reason: Violating group rules\n` +
-      `Ban expires: ${new Date(Date.now() + banDuration).toLocaleTimeString()}\n\n` +
-      `Please follow the rules to avoid longer bans.`,
+  setTimeout(() => {
+    if (userSessions.has(tradeId)) {
+      userSessions.delete(tradeId);
+      bot.sendMessage(chatId, `⏰ Trade offer from @${traderName} expired.`);
+    }
+  }, 5 * 60 * 1000);
+});
+
+bot.onText(/\/accepttrade/, (msg) => {
+  const chatId = msg.chat.id;
+  const accepterId = msg.from.id;
+  const accepterName = msg.from.username || msg.from.first_name;
+
+  // Find trade
+  let tradeId = null;
+  for (const [id, session] of userSessions.entries()) {
+    if (session.target === accepterName && session.stage === 'pending') {
+      tradeId = id;
+      break;
+    }
+  }
+
+  if (!tradeId) {
+    bot.sendMessage(chatId, '❌ No pending trade offers found!');
+    return;
+  }
+
+  const trade = userSessions.get(tradeId);
+  trade.stage = 'completed';
+
+  // Process trade (simplified - you'd add actual card/coin transfer logic)
+  db.run(`UPDATE users SET total_trades = total_trades + 1 WHERE user_id IN (?, ?)`, 
+         [trade.trader.id, accepterId]);
+
+  bot.sendMessage(chatId,
+    `✅ **TRADE COMPLETED!** ✅\n\n` +
+    `🤝 @${trade.trader.name} ↔️ @${accepterName}\n` +
+    `💎 Trade: ${trade.offer}\n\n` +
+    `🎉 Both traders earned 50 coins bonus!`,
+    { parse_mode: 'Markdown' }
+  );
+
+  // Give trade bonus
+  db.run(`UPDATE users SET coins = coins + 50 WHERE user_id IN (?, ?)`, 
+         [trade.trader.id, accepterId]);
+
+  userSessions.delete(tradeId);
+});
+
+// 🏆 ACHIEVEMENT SYSTEM
+const achievements = {
+  first_blood: { name: 'First Blood', desc: 'Win your first battle', reward: 200 },
+  card_collector: { name: 'Card Collector', desc: 'Collect 50 cards', reward: 500 },
+  rich_af: { name: 'Rich AF', desc: 'Reach 10,000 coins', reward: 1000 },
+  trading_tycoon: { name: 'Trading Tycoon', desc: 'Complete 25 trades', reward: 750 },
+  king_slayer: { name: 'King Slayer', desc: 'Defeat a reigning king in battle', reward: 1500 },
+  master_thief: { name: 'Master Thief', desc: 'Successfully rob 10 users', reward: 800 }
+};
+
+bot.onText(/\/achievements/, (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+
+  let achievementsText = `🏆 **YOUR ACHIEVEMENTS** 🏆\n\n`;
+
+  // Check each achievement
+  Object.entries(achievements).forEach(([key, achievement]) => {
+    achievementsText += `⭐ ${achievement.name}\n`;
+    achievementsText += `📝 ${achievement.desc}\n`;
+    achievementsText += `🎁 Reward: ${achievement.reward} coins\n\n`;
+  });
+
+  achievementsText += `💡 Complete challenges to unlock achievements!`;
+
+  bot.sendMessage(chatId, achievementsText, { parse_mode: 'Markdown' });
+});
+
+// 🎪 MORE GROUP GAMES
+
+bot.onText(/\/jackpot/, (msg) => {
+  const chatId = msg.chat.id;
+  const player = '@' + (msg.from.username || msg.from.first_name);
+  const jackpotAmount = 5000 + Math.floor(Math.random() * 5000);
+  const winChance = Math.random() > 0.95; // 5% chance
+
+  if (winChance) {
+    bot.sendMessage(chatId,
+      `🎰 **JACKPOT WINNER!** 🎰\n\n` +
+      `👤 ${player}\n` +
+      `💰 WON: ${jackpotAmount} coins!\n\n` +
+      `🎉 UNBELIEVABLE LUCK!`,
       { parse_mode: 'Markdown' }
     );
-  } catch (error) {
-    console.log('Could not DM banned user');
+
+    // Award coins
+    db.run(`UPDATE users SET coins = coins + ? WHERE user_id = ?`, [jackpotAmount, msg.from.id]);
+  } else {
+    bot.sendMessage(chatId,
+      `🎰 **JACKPOT** 🎰\n\n` +
+      `👤 ${player}\n` +
+      `💸 Better luck next time!\n\n` +
+      `💰 Current Jackpot: ${jackpotAmount} coins\n` +
+      `🎯 Next draw: 1 hour`,
+      { parse_mode: 'Markdown' }
+    );
   }
 });
 
-// UNBAN USER - Admin only
-bot.onText(/\/unban (@\w+|\d+)/, async (msg, match) => {
+bot.onText(/\/animequiz/, (msg) => {
   const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  const target = match[1];
-
-  if (!(await isUserAdminInDB(adminId)) && !ADMINS.includes(adminId)) {
-    bot.sendMessage(chatId, '❌ Admin only command!');
-    return;
-  }
-
-  let targetUserId;
   
-  if (target.startsWith('@')) {
-    targetUserId = await getUserIdFromUsername(target.slice(1));
-  } else {
-    targetUserId = parseInt(target);
-  }
+  const quizzes = [
+    {
+      question: "What is the name of Naruto's signature technique?",
+      options: ["Rasengan", "Chidori", "Kamehameha", "Gomu Gomu"],
+      answer: 0
+    },
+    {
+      question: "How many Dragon Balls are needed to summon Shenron?",
+      options: ["5", "6", "7", "8"],
+      answer: 2
+    },
+    {
+      question: "What is Luffy's favorite food?",
+      options: ["Sushi", "Ramen", "Meat", "Fruit"],
+      answer: 2
+    }
+  ];
 
-  if (!targetUserId) {
-    bot.sendMessage(chatId, '❌ User not found!');
-    return;
-  }
+  const quiz = quizzes[Math.floor(Math.random() * quizzes.length)];
+  const sessionId = `${chatId}_quiz`;
+  
+  userSessions.set(sessionId, {
+    type: 'quiz',
+    question: quiz.question,
+    answer: quiz.answer,
+    options: quiz.options
+  });
 
-  bannedUsers.delete(targetUserId);
-  bot.sendMessage(chatId, `✅ User has been unbanned!`);
+  let quizText = `🧠 **ANIME QUIZ** 🧠\n\n`;
+  quizText += `❓ ${quiz.question}\n\n`;
+  
+  quiz.options.forEach((option, index) => {
+    quizText += `${index + 1}️⃣ ${option}\n`;
+  });
+  
+  quizText += `\n💡 Reply with /answer [number]`;
+
+  bot.sendMessage(chatId, quizText, { parse_mode: 'Markdown' });
 });
 
-// WARN USER - Admin only
-bot.onText(/\/warn (@\w+|\d+)/, async (msg, match) => {
+bot.onText(/\/answer (\d)/, (msg, match) => {
   const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  const target = match[1];
+  const userAnswer = parseInt(match[1]) - 1;
+  const sessionId = `${chatId}_quiz`;
+  const session = userSessions.get(sessionId);
 
-  if (!(await isUserAdminInDB(adminId)) && !ADMINS.includes(adminId)) {
-    bot.sendMessage(chatId, '❌ Admin only command!');
+  if (!session || session.type !== 'quiz') {
+    bot.sendMessage(chatId, '❌ No active quiz found! Start one with /animequiz');
     return;
   }
 
-  let targetUserId;
-  
-  if (target.startsWith('@')) {
-    targetUserId = await getUserIdFromUsername(target.slice(1));
-  } else {
-    targetUserId = parseInt(target);
-  }
-
-  if (!targetUserId) {
-    bot.sendMessage(chatId, '❌ User not found!');
-    return;
-  }
-
-  // Add warning to user
-  db.run(`UPDATE users SET warnings = warnings + 1 WHERE user_id = ?`, [targetUserId]);
-
-  db.get(`SELECT warnings FROM users WHERE user_id = ?`, [targetUserId], (err, user) => {
-    const warnings = user?.warnings || 1;
+  if (userAnswer === session.answer) {
+    const reward = 100;
+    bot.sendMessage(chatId,
+      `🎉 **CORRECT!** 🎉\n\n` +
+      `✅ You won ${reward} coins!\n` +
+      `💡 ${session.options[session.answer]} was the right answer!`,
+      { parse_mode: 'Markdown' }
+    );
     
-    bot.sendMessage(chatId, 
-      `⚠️ User warned! Total warnings: ${warnings}/3\n` +
-      `🚫 3 warnings will result in automatic ban.`,
+    // Award coins
+    db.run(`UPDATE users SET coins = coins + ? WHERE user_id = ?`, [reward, msg.from.id]);
+  } else {
+    bot.sendMessage(chatId,
+      `❌ **WRONG!** ❌\n\n` +
+      `💡 Correct answer was: ${session.options[session.answer]}\n` +
+      `🔄 Try again with /animequiz`,
       { parse_mode: 'Markdown' }
     );
+  }
 
-    // Auto-ban after 3 warnings
-    if (warnings >= 3) {
-      const banDuration = 10 * 60 * 1000;
-      bannedUsers.set(targetUserId, Date.now() + banDuration);
-      db.run(`UPDATE users SET warnings = 0 WHERE user_id = ?`, [targetUserId]);
-      
-      bot.sendMessage(chatId, 
-        `🚫 Auto-ban activated! User reached 3 warnings.\n` +
-        `⏰ Banned for 10 minutes.`,
-        { parse_mode: 'Markdown' }
-      );
-    }
-
-    // Notify warned user
-    try {
-      bot.sendMessage(targetUserId, 
-        `⚠️ *You have received a warning!*\n\n` +
-        `Total warnings: ${warnings}/3\n` +
-        `🚫 3 warnings will result in automatic ban.\n\n` +
-        `Please follow the group rules.`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (error) {
-      console.log('Could not DM warned user');
-    }
-  });
+  userSessions.delete(sessionId);
 });
 
-// BROADCAST - Admin only (DM only)
-bot.onText(/\/broadcast (.+)/, async (msg, match) => {
+// 🎯 DAILY MISSIONS
+bot.onText(/\/missions/, (msg) => {
   const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-  const message = match[1];
-  const isPrivate = msg.chat.type === 'private';
+  
+  const missions = [
+    "🎴 Collect 3 new cards today",
+    "⚔️ Win 2 battles",
+    "🤝 Complete 1 trade",
+    "💸 Earn 500 coins",
+    "🦹 Successfully rob 1 user",
+    "🏆 Reach top 5 in leaderboard"
+  ];
 
-  if (!(await isUserAdminInDB(adminId)) && !ADMINS.includes(adminId)) {
-    bot.sendMessage(chatId, '❌ Admin only command!');
-    return;
-  }
-
-  if (!isPrivate) {
-    bot.sendMessage(chatId, '❌ Broadcast can only be used in private chat!');
-    return;
-  }
-
-  bot.sendMessage(chatId, '📢 Starting broadcast to all users...');
-
-  // Get all users from database
-  db.all(`SELECT user_id FROM users`, async (err, users) => {
-    if (err) {
-      bot.sendMessage(chatId, '❌ Error getting user list!');
-      return;
-    }
-
-    let success = 0;
-    let failed = 0;
-
-    for (const user of users) {
-      try {
-        await bot.sendMessage(user.user_id, 
-          `📢 *Announcement from Admin:*\n\n${message}\n\n- Zenon Bot Team`,
-          { parse_mode: 'Markdown' }
-        );
-        success++;
-        // Small delay to avoid rate limits
-        await new Promise(resolve => setTimeout(resolve, 100));
-      } catch (error) {
-        failed++;
-      }
-    }
-
-    bot.sendMessage(chatId, 
-      `📊 Broadcast completed!\n\n` +
-      `✅ Success: ${success} users\n` +
-      `❌ Failed: ${failed} users`,
-      { parse_mode: 'Markdown' }
-    );
+  let missionsText = `🎯 **DAILY MISSIONS** 🎯\n\n`;
+  
+  missions.forEach((mission, index) => {
+    const status = Math.random() > 0.5 ? '✅' : '⏳';
+    missionsText += `${status} ${mission}\n`;
   });
+  
+  missionsText += `\n💎 Complete all missions for 500 coin bonus!`;
+
+  bot.sendMessage(chatId, missionsText, { parse_mode: 'Markdown' });
 });
 
-// ADMIN STATS - Admin only
-bot.onText(/\/adminstats/, async (msg) => {
-  const chatId = msg.chat.id;
-  const adminId = msg.from.id;
-
-  if (!(await isUserAdminInDB(adminId)) && !ADMINS.includes(adminId)) {
-    bot.sendMessage(chatId, '❌ Admin only command!');
-    return;
-  }
-
-  db.get(`SELECT COUNT(*) as total_users FROM users`, (err, userCount) => {
-    db.get(`SELECT COUNT(*) as total_cards FROM user_cards`, (err, cardCount) => {
-      db.get(`SELECT COUNT(*) as active_bans FROM users WHERE warnings >= 1`, (err, warnCount) => {
-        
-        const statsText = `📊 *Admin Statistics*\n\n` +
-          `👥 Total Users: ${userCount.total_users}\n` +
-          `🎴 Total Cards Collected: ${cardCount.total_cards}\n` +
-          `⚠️ Users with Warnings: ${warnCount.active_bans}\n` +
-          `🚫 Currently Banned: ${bannedUsers.size}\n` +
-          `🤖 Bot by: Zenon\n` +
-          `🕒 Uptime: ${formatUptime(process.uptime())}`;
-
-        bot.sendMessage(chatId, statsText, { parse_mode: 'Markdown' });
-      });
-    });
-  });
-});
-
-// 🎴 GAME COMMANDS - DM ONLY
-
-// COLLECTION - DM only
-bot.onText(/\/collection/, (msg) => {
+// 🏅 ENHANCED PROFILE SYSTEM
+bot.onText(/\/mystats/, (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
-  const isPrivate = msg.chat.type === 'private';
-
-  if (!isPrivate) {
-    bot.sendMessage(chatId, '❌ Please use this command in private chat with the bot!');
-    return;
-  }
-
-  showCollectionMenu(chatId, userId);
-});
-
-// BALANCE - DM only
-bot.onText(/\/balance/, (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const isPrivate = msg.chat.type === 'private';
-
-  if (!isPrivate) {
-    bot.sendMessage(chatId, '❌ Please use this command in private chat!');
-    return;
-  }
-
-  db.get(`SELECT coins, energy FROM users WHERE user_id = ?`, [userId], (err, user) => {
-    if (!user) {
-      bot.sendMessage(chatId, '❌ Please use /start first!');
-      return;
-    }
-
-    bot.sendMessage(chatId, 
-      `💰 *Your Balance*\n\n` +
-      `🪙 Coins: ${user.coins}\n` +
-      `⚡ Energy: ${user.energy}/100\n\n` +
-      `Use /daily to claim free coins!`,
-      { parse_mode: 'Markdown' }
-    );
-  });
-});
-
-// DAILY REWARD - DM only
-bot.onText(/\/daily/, (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const isPrivate = msg.chat.type === 'private';
-
-  if (!isPrivate) {
-    bot.sendMessage(chatId, '❌ Please use this command in private chat!');
-    return;
-  }
-
-  db.get(`SELECT last_daily, coins FROM users WHERE user_id = ?`, [userId], (err, user) => {
-    if (!user) {
-      bot.sendMessage(chatId, '❌ Please use /start first!');
-      return;
-    }
-
-    const now = new Date();
-    if (user.last_daily) {
-      const lastDaily = new Date(user.last_daily);
-      const hoursDiff = (now - lastDaily) / (1000 * 60 * 60);
-      
-      if (hoursDiff < 24) {
-        const hoursLeft = 24 - hoursDiff;
-        bot.sendMessage(chatId, 
-          `⏰ You already claimed your daily reward!\n\n🕒 Come back in ${Math.ceil(hoursLeft)} hours!`);
-        return;
-      }
-    }
-
-    const dailyCoins = 100 + Math.floor(Math.random() * 50);
-    db.run(`UPDATE users SET coins = coins + ?, last_daily = ? WHERE user_id = ?`, 
-      [dailyCoins, now, userId], function(err) {
-      if (err) {
-        bot.sendMessage(chatId, '❌ Error claiming daily reward!');
-        return;
-      }
-
-      bot.sendMessage(chatId, 
-        `🎉 *Daily Reward Claimed!*\n\n` +
-        `🪙 +${dailyCoins} coins!\n\n` +
-        `Come back in 24 hours for more!`,
-        { parse_mode: 'Markdown' }
-      );
-    });
-  });
-});
-
-// BATTLE - DM only  
-bot.onText(/\/battle/, (msg) => {
-  const chatId = msg.chat.id;
-  const isPrivate = msg.chat.type === 'private';
-
-  if (!isPrivate) {
-    bot.sendMessage(chatId, '❌ Please use this command in private chat!');
-    return;
-  }
-
-  const battleText = `⚔️ *BATTLE ARENA*\n\n` +
-    `Choose your battle mode:\n\n` +
-    `🎯 Quick Battle - Fight random opponent\n` +
-    `🏆 Ranked Match - Earn ranking points\n` +
-    `👥 Team Battle - 3v3 card showdown\n` +
-    `🤖 AI Challenge - Practice against bot\n\n` +
-    `⚡ Energy Cost: 10 per battle\n` +
-    `💰 Rewards: Coins, EXP, and rare cards!`;
-
-  bot.sendMessage(chatId, battleText, { parse_mode: 'Markdown' });
-});
-
-// PROFILE - DM only
-bot.onText(/\/profile/, (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const isPrivate = msg.chat.type === 'private';
-
-  if (!isPrivate) {
-    bot.sendMessage(chatId, '❌ Please use this command in private chat!');
-    return;
-  }
+  const username = msg.from.username || msg.from.first_name;
 
   db.get(`SELECT * FROM users WHERE user_id = ?`, [userId], (err, user) => {
     if (!user) {
@@ -684,360 +398,276 @@ bot.onText(/\/profile/, (msg) => {
     }
 
     db.get(`SELECT COUNT(*) as total_cards FROM user_cards WHERE user_id = ?`, [userId], (err, cards) => {
-      const level = user.level || 1;
-      const exp = user.exp || 0;
-      const expNeeded = level * 100;
-      const progress = Math.min((exp / expNeeded) * 100, 100);
-      const progressBar = createProgressBar(progress);
+      const rank = user.battles_won > 50 ? 'Legend' : user.battles_won > 20 ? 'Veteran' : 'Rookie';
+      const winRate = user.battles_won + user.battles_lost > 0 
+        ? Math.round((user.battles_won / (user.battles_won + user.battles_lost)) * 100) 
+        : 0;
 
-      const profileText = `🏆 *PLAYER PROFILE*\n\n` +
-        `👤 ${user.username || 'Player'}\n` +
-        `🎯 ${user.title || 'Beginner Collector'}\n\n` +
-        `📊 *Stats:*\n` +
-        `⭐ Level: ${level}\n` +
-        `📈 EXP: ${exp}/${expNeeded}\n` +
-        `${progressBar}\n` +
+      const statsText = `📊 **PLAYER STATS - @${username}** 📊\n\n` +
+        `🎯 Rank: ${rank}\n` +
+        `⭐ Level: ${user.level}\n` +
+        `📈 EXP: ${user.exp}/100\n` +
         `🎴 Cards: ${cards.total_cards}\n` +
         `🪙 Coins: ${user.coins}\n` +
-        `💎 Dust: ${user.dust}\n` +
-        `⚡ Energy: ${user.energy}/100\n\n` +
-        `⚔️ *Battle Record:*\n` +
-        `🏆 Wins: ${user.battles_won || 0}\n` +
-        `💔 Losses: ${user.battles_lost || 0}\n` +
-        `🤝 Trades: ${user.total_trades || 0}`;
+        `💎 Dust: ${user.dust}\n\n` +
+        `⚔️ Battle Record:\n` +
+        `🏆 Wins: ${user.battles_won}\n` +
+        `💔 Losses: ${user.battles_lost}\n` +
+        `📊 Win Rate: ${winRate}%\n\n` +
+        `🤝 Trades: ${user.total_trades}\n` +
+        `👑 King Wins: ${user.king_wins}\n\n` +
+        `🎯 Complete /missions for bonuses!`;
 
-      bot.sendMessage(chatId, profileText, { parse_mode: 'Markdown' });
+      bot.sendMessage(chatId, statsText, { parse_mode: 'Markdown' });
     });
   });
 });
 
-// SHOP - DM only
-bot.onText(/\/shop/, (msg) => {
+// 🎁 SPECIAL EVENT SYSTEM
+bot.onText(/\/event/, (msg) => {
   const chatId = msg.chat.id;
-  const isPrivate = msg.chat.type === 'private';
-
-  if (!isPrivate) {
-    bot.sendMessage(chatId, '❌ Please use this command in private chat!');
-    return;
-  }
-
-  const shopText = `🛍️ *CARD SHOP*\n\n` +
-    `🎴 *CARD PACKS:*\n` +
-    `• Starter Pack - 🪙100 (3 Common Cards)\n` +
-    `• Advanced Pack - 🪙300 (2 Rare, 1 Epic)\n` +
-    `• Premium Pack - 🪙500 (1 Legendary Guaranteed)\n\n` +
-    `🎨 *COSMETICS:*\n` +
-    `• Name Color - 🪙200\n` +
-    `• Special Frame - 🪙150\n` +
-    `• Profile Badge - 🪙300\n\n` +
-    `Use /buy [item] to purchase!`;
-
-  bot.sendMessage(chatId, shopText, { parse_mode: 'Markdown' });
-});
-
-// LEADERBOARD - DM only
-bot.onText(/\/leaderboard/, (msg) => {
-  const chatId = msg.chat.id;
-  const isPrivate = msg.chat.type === 'private';
-
-  if (!isPrivate) {
-    bot.sendMessage(chatId, '❌ Please use this command in private chat!');
-    return;
-  }
-
-  db.all(`SELECT username, total_cards, coins, level FROM users ORDER BY total_cards DESC LIMIT 10`, (err, users) => {
-    let leaderboardText = `🏆 *GLOBAL LEADERBOARD*\n\n`;
-
-    users.forEach((user, index) => {
-      const rankEmoji = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `▫️`;
-      leaderboardText += `${rankEmoji} *${user.username || 'Anonymous'}*\n`;
-      leaderboardText += `   🎴 ${user.total_cards} cards | ⭐ Lvl ${user.level}\n\n`;
-    });
-
-    bot.sendMessage(chatId, leaderboardText, { parse_mode: 'Markdown' });
-  });
-});
-
-// 🎴 CARD DROP FUNCTION (Group only)
-function postRandomCardDrop() {
-  const sampleCards = [
-    { 
-      name: 'Naruto (Six Paths)', 
-      anime: 'Naruto', 
-      rarity: 'Legendary', 
-      power: 950, 
-      element: 'Six Paths',
-      card_id: 1
+  
+  const events = [
+    {
+      name: "⚡ DOUBLE DROP WEEKEND",
+      desc: "Twice the card drops every 20 minutes!",
+      duration: "48 hours"
     },
-    { 
-      name: 'Luffy (Gear 5)', 
-      anime: 'One Piece', 
-      rarity: 'Legendary', 
-      power: 980, 
-      element: 'Sun God',
-      card_id: 2
+    {
+      name: "🎪 BATTLE TOURNAMENT",
+      desc: "Compete for the championship title!",
+      duration: "24 hours"
     },
-    { 
-      name: 'Goku (Ultra Instinct)', 
-      anime: 'Dragon Ball', 
-      rarity: 'Legendary', 
-      power: 1000, 
-      element: 'Ultra Instinct',
-      card_id: 3
-    },
-    { 
-      name: 'Gojo Satoru', 
-      anime: 'Jujutsu Kaisen', 
-      rarity: 'Epic', 
-      power: 480, 
-      element: 'Limitless',
-      card_id: 4
-    },
-    { 
-      name: 'Tanjiro (Hinokami)', 
-      anime: 'Demon Slayer', 
-      rarity: 'Epic', 
-      power: 470, 
-      element: 'Sun Breathing',
-      card_id: 5
-    },
-    { 
-      name: 'Sung Jin-Woo (Shadow)', 
-      anime: 'Solo Leveling', 
-      rarity: 'Epic', 
-      power: 490, 
-      element: 'Shadow',
-      card_id: 6
-    },
-    { 
-      name: 'Levi Ackerman', 
-      anime: 'Attack on Titan', 
-      rarity: 'Rare', 
-      power: 180, 
-      element: 'Ackerman',
-      card_id: 7
-    },
-    { 
-      name: 'Zoro (Three Sword)', 
-      anime: 'One Piece', 
-      rarity: 'Rare', 
-      power: 190, 
-      element: 'Swordsman',
-      card_id: 8
+    {
+      name: "💎 MEGA TRADE FAIR",
+      desc: "Bonus coins for every trade completed!",
+      duration: "72 hours"
     }
   ];
 
-  const card = sampleCards[Math.floor(Math.random() * sampleCards.length)];
-  const redeemCode = generateRedeemCode();
+  const event = events[Math.floor(Math.random() * events.length)];
+  
+  bot.sendMessage(chatId,
+    `🎉 **SPECIAL EVENT** 🎉\n\n` +
+    `📢 ${event.name}\n` +
+    `📝 ${event.desc}\n` +
+    `⏰ Duration: ${event.duration}\n\n` +
+    `🚀 Event starts in 1 hour!`,
+    { parse_mode: 'Markdown' }
+  );
+});
 
-  // Store the redeem code (expires in 5 minutes)
-  activeRedeemCodes.set(redeemCode, {
-    card: card,
-    expiry: Date.now() + (5 * 60 * 1000), // 5 minutes
-    redeemedBy: []
-  });
+// 🔧 EQUIPMENT MANAGEMENT
+bot.onText(/\/equipment/, (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
 
-  const rarityEmojis = { 
-    'Common': '🟢', 
-    'Rare': '🔵', 
-    'Epic': '🟣', 
-    'Legendary': '🟡', 
-    'Mythical': '🔴' 
-  };
-
-  const message = `
-🎴 **CARD DROP!** by *Zenon Bot* 🎌
-
-${rarityEmojis[card.rarity]} **${card.name}**
-📺 Anime: ${card.anime}
-⭐ Rarity: ${card.rarity}
-⚡ Power: ${card.power}
-🌀 Element: ${card.element}
-
-💎 **Use this code to claim:**
-\`/redeem ${redeemCode}\`
-
-⏰ **First come, first serve!**
-🔒 *Code expires in 5 minutes*
-  `;
-
-  bot.sendMessage(GROUP_ID, message, { parse_mode: 'Markdown' });
-
-  // Auto-remove expired code after 5 minutes
-  setTimeout(() => {
-    if (activeRedeemCodes.has(redeemCode)) {
-      activeRedeemCodes.delete(redeemCode);
+  db.get(`SELECT equipment FROM users WHERE user_id = ?`, [userId], (err, user) => {
+    let equipmentText = `🛡️ **YOUR EQUIPMENT** 🛡️\n\n`;
+    
+    try {
+      const equipment = JSON.parse(user.equipment || '[]');
+      
+      if (equipment.length === 0) {
+        equipmentText += `❌ No equipment owned\n`;
+        equipmentText += `🛍️ Visit /shop to buy some!`;
+      } else {
+        equipment.forEach(item => {
+          equipmentText += `🔹 ${item.name}\n`;
+          equipmentText += `   Type: ${item.type}\n`;
+          equipmentText += `   Effect: ${item.effect}\n\n`;
+        });
+      }
+    } catch (e) {
+      equipmentText += `❌ Error loading equipment`;
     }
-  }, 5 * 60 * 1000);
-}
 
-// 🛠️ HELPER FUNCTIONS
-function generateRedeemCode() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let code = '';
-  for (let i = 0; i < 8; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
+    bot.sendMessage(chatId, equipmentText, { parse_mode: 'Markdown' });
+  });
+});
+
+bot.onText(/\/buy (.+)/, (msg, match) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const itemName = match[1].toLowerCase();
+
+  db.get(`SELECT * FROM equipment WHERE LOWER(name) = ?`, [itemName], (err, item) => {
+    if (!item) {
+      bot.sendMessage(chatId, `❌ Equipment "${match[1]}" not found! Check /shop`);
+      return;
+    }
+
+    db.get(`SELECT coins FROM users WHERE user_id = ?`, [userId], (err, user) => {
+      if (user.coins < item.price) {
+        bot.sendMessage(chatId, 
+          `❌ Not enough coins! You need ${item.price} but have ${user.coins}`);
+        return;
+      }
+
+      // Add to user's equipment
+      db.get(`SELECT equipment FROM users WHERE user_id = ?`, [userId], (err, userData) => {
+        let equipment = [];
+        try {
+          equipment = JSON.parse(userData.equipment || '[]');
+        } catch (e) {
+          equipment = [];
+        }
+
+        equipment.push({
+          name: item.name,
+          type: item.type,
+          effect: item.effect,
+          rarity: item.rarity
+        });
+
+        // Update user
+        db.run(`UPDATE users SET coins = coins - ?, equipment = ? WHERE user_id = ?`,
+               [item.price, JSON.stringify(equipment), userId]);
+
+        bot.sendMessage(chatId,
+          `✅ **PURCHASE SUCCESSFUL!** ✅\n\n` +
+          `🛍️ Item: ${item.name}\n` +
+          `💰 Price: ${item.price} coins\n` +
+          `✨ Effect: ${item.effect}\n\n` +
+          `🎯 Use /equipment to view your items!`,
+          { parse_mode: 'Markdown' }
+        );
+      });
+    });
+  });
+});
+
+// 🕒 ENERGY REGENERATION SYSTEM
+cron.schedule('*/5 * * * *', () => {
+  db.run(`UPDATE users SET energy = LEAST(100, energy + 1) WHERE energy < 100`);
+});
+
+// 🎊 GROUP ACTIVITY SYSTEM
+cron.schedule('0 */2 * * *', () => {
+  const activities = [
+    "🎯 Quick! The first 5 people to type /claim get 100 coins!",
+    "⚡ FLASH EVENT! Next card drop in 5 minutes will be LEGENDARY!",
+    "🤝 Trading hour! All trades get 50% bonus coins for 1 hour!",
+    "🏆 Battle tournament starting in 30 minutes! Prepare your teams!",
+    "💎 Special mission: Collect 3 Naruto cards today for 300 coin bonus!"
+  ];
+
+  const activity = activities[Math.floor(Math.random() * activities.length)];
+  
+  bot.sendMessage(GROUP_ID,
+    `🎊 **GROUP ACTIVITY** 🎊\n\n` +
+    `${activity}\n\n` +
+    `💬 Stay active for more surprises!`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/\/claim/, (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  
+  if (chatId.toString() === GROUP_ID) {
+    const reward = 100;
+    db.run(`UPDATE users SET coins = coins + ? WHERE user_id = ?`, [reward, userId]);
+    
+    bot.sendMessage(chatId,
+      `🎉 @${msg.from.username || msg.from.first_name} claimed ${reward} coins!\n` +
+      `💰 Quick hands pay off!`,
+      { parse_mode: 'Markdown' }
+    );
   }
-  return code;
-}
+});
 
-function showMainMenu(chatId, userId) {
-  const menuText = `🎌 *Anime Card Collector by Zenon* 🎴
+// 🎯 COMPREHENSIVE HELP COMMAND
+bot.onText(/\/help/, (msg) => {
+  const chatId = msg.chat.id;
+  const isPrivate = msg.chat.type === 'private';
 
-🏠 **Main Menu** - Choose a command:
+  if (isPrivate) {
+    const privateHelp = `🎌 **ANIME CARD BOT - COMPLETE GUIDE** 🎴
 
-🎴 *Card Management*
-/collection - View your cards
+🎮 **GAME COMMANDS:**
+/start - Begin your journey
+/collection - View your cards  
 /balance - Check coins & energy
 /daily - Claim daily reward
-/shop - Buy card packs
+/profile - Your complete stats
+/shop - Buy cards & equipment
+/equipment - Manage your items
 
-⚔️ *Gameplay*
-/battle - Battle players
-/leaderboard - Rankings
+⚔️ **BATTLE SYSTEM:**
+/battle @user - Challenge to duel
+/mystats - Your battle record
+/leaderboard - Top players
 
-🤝 *Social*
-/trade - Start trading
-/market - Marketplace
+🤝 **TRADING:**
+/trade @user [offer] - Make trade offer
+/accepttrade - Accept pending trade
 
-🏆 *Profile*
-/profile - Your stats
-/achievements - Progress
+🏆 **PROGRESSION:**
+/achievements - View challenges
+/missions - Daily objectives
+/upgrade - Enhance your cards
 
-❓ *Help*
-/help - All commands
+🎯 **GROUP-ONLY COMMANDS:**
+(Join our group for these!)
+/redeem [code] - Claim card drops
+/rob @user - Attempt robbery
+/giveaway - Daily free rewards
+/battleroyale - Group battle
+/jackpot - Win huge prizes
+/animequiz - Test your knowledge
 
-✨ *Group Features:*
-• Card drops every 25 minutes!
-• Use /redeem in group to claim cards
-• Compete with other collectors!`;
+🔧 **Need help?** Ask in the group!`;
 
-  bot.sendMessage(chatId, menuText, { parse_mode: 'Markdown' });
-}
+    bot.sendMessage(chatId, privateHelp, { parse_mode: 'Markdown' });
+  } else {
+    const groupHelp = `🎌 **GROUP COMMANDS** 🎴
 
-function showCollectionMenu(chatId, userId) {
-  db.get(`SELECT COUNT(*) as total FROM user_cards WHERE user_id = ?`, [userId], (err, result) => {
-    const totalCards = result.total;
-    
-    db.all(`SELECT c.card_rarity, COUNT(*) as count FROM user_cards uc 
-            JOIN cards c ON uc.card_id = c.card_id 
-            WHERE uc.user_id = ? GROUP BY c.card_rarity`, [userId], (err, rarityStats) => {
-      
-      let collectionText = `🎴 *YOUR COLLECTION*\n\n`;
-      collectionText += `📊 Total Cards: ${totalCards}/100\n\n`;
-      
-      const rarityEmojis = { 'Common': '🟢', 'Rare': '🔵', 'Epic': '🟣', 'Legendary': '🟡', 'Mythical': '🔴' };
-      
-      if (rarityStats.length > 0) {
-        rarityStats.forEach(stat => {
-          collectionText += `${rarityEmojis[stat.card_rarity]} ${stat.card_rarity}: ${stat.count}\n`;
-        });
-      } else {
-        collectionText += `No cards yet! Redeem codes in the group!\n`;
-      }
-      
-      collectionText += `\n✨ *Collection Commands:*\n`;
-      collectionText += `/view [id] - View specific card\n`;
-      collectionText += `/upgrade [id] - Upgrade card\n`;
-      collectionText += `/fuse [id1] [id2] - Combine cards`;
+🎮 **FUN & GAMES:**
+/giveaway - Free daily rewards
+/battleroyale - Battle everyone
+/duel @user - 1v1 challenge  
+/spin - Lucky wheel
+/jackpot - Win huge prizes
+/animequiz - Test anime knowledge
+/event - Special events
 
-      bot.sendMessage(chatId, collectionText, { parse_mode: 'Markdown' });
-    });
-  });
-}
+💰 **ECONOMY:**
+/rob @user - Steal 50% coins
+/shop - Buy equipment
+/mystats - Your profile
+/grouplb - Group rankings
 
-async function getUserIdFromUsername(username) {
-  // This would require storing username->userID mapping
-  // For now, return null - you'd need to implement this
-  return null;
-}
+🎴 **CARD SYSTEM:**
+/redeem [code] - Claim drops
+/king - Current king info
+/missions - Daily challenges
 
-function formatUptime(seconds) {
-  const days = Math.floor(seconds / (24 * 60 * 60));
-  const hours = Math.floor((seconds % (24 * 60 * 60)) / (60 * 60));
-  const minutes = Math.floor((seconds % (60 * 60)) / 60);
-  
-  return `${days}d ${hours}h ${minutes}m`;
-}
+🤝 **SOCIAL:**
+/trade @user [offer] - Trade cards
+/active - Online collectors
+/groupstats - Group analytics
 
-function createProgressBar(percentage) {
-  const bars = 10;
-  const filled = Math.round((percentage / 100) * bars);
-  const empty = bars - filled;
-  return '█'.repeat(filled) + '░'.repeat(empty) + ` ${Math.round(percentage)}%`;
-}
+⚔️ **COMBAT:**
+/battle @user - Duel system
+/acceptbattle - Accept challenge
 
-function initializeSampleCards() {
-  const sampleCards = [
-    ['Naruto Uzumaki', 'Naruto', 'Common', '', 50, 'Wind'],
-    ['Sasuke Uchiha', 'Naruto', 'Common', '', 55, 'Fire'],
-    ['Luffy (Pre-Timeskip)', 'One Piece', 'Common', '', 60, 'Rubber'],
-    ['Goku (Kid)', 'Dragon Ball', 'Common', '', 45, 'Martial Arts'],
-    ['Gojo Satoru', 'Jujutsu Kaisen', 'Epic', '', 480, 'Limitless'],
-    ['Sukuna', 'Jujutsu Kaisen', 'Legendary', '', 900, 'Cursed Energy']
-  ];
+🔧 **Full game features in private chat!**
+Message me to start collecting!`;
 
-  const insertStmt = db.prepare(`INSERT OR IGNORE INTO cards 
-    (card_name, card_anime, card_rarity, card_image, card_power, card_element) 
-    VALUES (?, ?, ?, ?, ?, ?)`);
-  
-  sampleCards.forEach(card => {
-    insertStmt.run(card);
-  });
-  insertStmt.finalize();
-
-  console.log('🎌 Sample cards initialized!');
-}
-
-function postSpecialEventCard() {
-  // Special event card implementation
-  console.log('🎉 Special event card feature ready!');
-}
-
-function resetDailyEnergy() {
-  db.run(`UPDATE users SET energy = 100, last_energy_update = CURRENT_TIMESTAMP`);
-  console.log('⚡ Daily energy reset!');
-}
-
-// 🚀 BOT STARTUP MESSAGE
-console.log('=================================');
-console.log('🎌 Anime Card Bot by Zenon');
-console.log('🤖 Bot Token: 8461726439:AAFRf0lB1QK9m0POjlwaJA0eV6nkW-Zjqjo');
-console.log('👥 Group ID: -1003149343469');
-console.log('👑 Admin ID: 6094186912');
-console.log('🎴 Card drops: Every 25 minutes');
-console.log('🛡️ Admin system: Active');
-console.log('🚫 Ban system: Active (10min)');
-console.log('💬 DM commands: Full game features');
-console.log('👥 Group commands: /redeem only');
-console.log('=================================');
-
-// Error handling
-bot.on('error', (error) => {
-  console.error('Bot Error:', error);
-});
-
-bot.on('polling_error', (error) => {
-  console.error('Polling Error:', error);
-});
-
-module.exports = { bot, db };
-
-// Export for server.js
-module.exports = {
-  bot: bot,
-  db: db,
-  startBot: function() {
-    console.log('🤖 Anime Card Bot Started!');
-    console.log('🎴 Card drops: Every 25 minutes');
-    console.log('🛡️ Admin system: Active');
-    console.log('💬 DM commands: Full game features');
-    return true;
+    bot.sendMessage(chatId, groupHelp, { parse_mode: 'Markdown' });
   }
-};
+});
 
-// If this file is run directly, start the bot
-if (require.main === module) {
-  console.log('🚀 Starting bot in standalone mode...');
-  module.exports.startBot();
-}
+// 🚀 BOT STATUS
+console.log('=================================');
+console.log('🎌 PART 2 FEATURES LOADED!');
+console.log('⚔️ Battle System: ACTIVE');
+console.log('🤝 Trading System: ACTIVE');
+console.log('🏆 Achievements: ACTIVE');
+console.log('🎮 Mini-Games: ACTIVE');
+console.log('🎯 Missions: ACTIVE');
+console.log('🛡️ Equipment: ACTIVE');
+console.log('🎊 Events: ACTIVE');
+console.log('=================================');
